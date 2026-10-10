@@ -163,7 +163,8 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-See [the test matrix](docs/testing.md) and [the implementation plan](docs/plan.md).
+See [the verification report](docs/verification.md), [the test matrix](docs/testing.md),
+and [the implementation plan](docs/plan.md).
 CI runs formatting, Clippy, tests, release build, and demo output on Linux/macOS.
 No CI credentials or real Jira instance are needed.
 
