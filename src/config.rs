@@ -6,6 +6,23 @@ pub struct Config {
     pub jira: JiraConfig,
     #[serde(default)]
     pub board_id: u64,
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+}
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +110,7 @@ impl Config {
             return Err("Jira auth must be basic or bearer".into());
         }
         cfg.jira.max_results = cfg.jira.max_results.clamp(1, 100);
+        cfg.notifications.interval_seconds = cfg.notifications.interval_seconds.clamp(30, 3600);
         Ok(cfg)
     }
 
@@ -126,6 +144,15 @@ mod tests {
         let cfg = Config::parse("[jira]\nbase_url='https://example.atlassian.net/'\napi_token_cmd='pass jira'\n[[filters]]\nname='Old'\njql='x'").unwrap();
         assert_eq!(cfg.jira.base_url, "https://example.atlassian.net");
         assert!(Config::parse("[jira]\nbase_url='http://example.com'").is_err());
+    }
+    #[test]
+    fn notification_defaults_and_polling_limits_are_safe() {
+        let cfg = Config::parse("[jira]\nbase_url='https://example.atlassian.net'").unwrap();
+        assert!(cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.interval_seconds, 60);
+        let cfg=Config::parse("[notifications]\nenabled=false\ninterval_seconds=1\n[jira]\nbase_url='https://example.atlassian.net'").unwrap();
+        assert!(!cfg.notifications.enabled);
+        assert_eq!(cfg.notifications.interval_seconds, 30);
     }
     #[test]
     fn invalid_config_does_not_echo_secrets() {

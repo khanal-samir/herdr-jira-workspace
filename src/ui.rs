@@ -66,7 +66,8 @@ pub fn draw(frame: &mut Frame, app: &App) -> Hits {
         ])
         .split(area);
     let heading = format!(
-        " JIRA WORKSPACE{}  /  {} ",
+        " JIRA WORKSPACE {}{}  /  {} ",
+        env!("CARGO_PKG_VERSION"),
         if app.demo { " · DEMO" } else { "" },
         if app.board.name.is_empty() {
             "Choose a board"
@@ -85,11 +86,31 @@ pub fn draw(frame: &mut Frame, app: &App) -> Hits {
             ),
         regions[0],
     );
+    let bell = Rect::new(
+        regions[0].right().saturating_sub(17),
+        regions[0].y + 1,
+        16,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" N alerts ({})", app.notifications.unread())).style(
+            Style::default()
+                .fg(if app.notifications.unread() > 0 {
+                    GOOD
+                } else {
+                    MUTED
+                })
+                .bg(PANEL),
+        ),
+        bell,
+    );
+    hits.notification = Some(bell);
     let tab = match app.view {
         View::Board => "BOARD",
         View::Details => "TICKET",
         View::Calendar => "WORKLOG CALENDAR",
         View::Image => "IMAGE",
+        View::Notifications => "NOTIFICATIONS",
     };
     frame.render_widget(
         Paragraph::new(format!(
@@ -108,13 +129,15 @@ pub fn draw(frame: &mut Frame, app: &App) -> Hits {
         View::Board=>draw_board(frame,regions[2],app,&mut hits),
         View::Details=>draw_details(frame,regions[2],app,&mut hits),
         View::Calendar=>draw_calendar_view(frame,regions[2],app,&mut hits),
+        View::Notifications=>draw_notifications(frame,regions[2],app,&mut hits),
         View::Image=>frame.render_widget(Paragraph::new(format!("{}\n\nImage is rendered by Herdr's experimental pane graphics.\nEsc returns to the attachment list.",app.image_name)).block(block("Image preview",true)),regions[2]),
     }
     let keys=match app.view{
-        View::Board=>"↑↓ card  ←→ column  Enter ticket  Shift+←→ move  Shift+↑↓ rank\nw log work  g calendar  c comments  l labels  e edit  b boards  / filter  ? help  q quit",
-        View::Details=>"Tab panel  ↑↓ entry  PgUp/PgDn scroll  n new  e edit  p quote reply  D delete\nw log work  g calendar  l labels  i attachments  o browser  Esc board  ? help",
+        View::Board=>"↑↓ card  ←→ column  Enter ticket  Shift+←→ move  Shift+↑↓ rank\nw log work  g calendar  a activity  c comments  l labels  e edit  b boards  / filter  N alerts  ? help  q quit",
+        View::Details=>"Tab panel  ↑↓ entry  PgUp/PgDn scroll  n new  e edit  p quote reply  D delete\nw log work  g calendar  a activity  f filter feed  i attachments  o browser  N alerts  Esc board  ? help",
         View::Calendar=>"←→ day  ↑↓ week  PgUp/PgDn month  j/k entry  a mine/team  v week/month\nw log work  e edit  D delete  Enter ticket  t today  r reload  Esc board",
         View::Image=>"Esc return to attachments",
+        View::Notifications=>"↑↓ select · Enter opens activity · a mark all read · m mute toasts\nEsc returns to board · alerts cover the selected board while this plugin runs",
     };
     frame.render_widget(
         Paragraph::new(keys).style(Style::default().fg(MUTED)),
@@ -138,6 +161,9 @@ pub fn draw(frame: &mut Frame, app: &App) -> Hits {
     );
     if let Some(dialog) = &app.dialog {
         draw_dialog(frame, area, app, dialog, &mut hits);
+    }
+    if let Some(picker) = &app.mentions {
+        draw_mentions(frame, area, picker, &mut hits);
     }
     hits
 }
@@ -273,9 +299,9 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
     );
     let tabs = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(25); 4])
+        .constraints([Constraint::Percentage(20); 5])
         .split(parts[1]);
-    for (index, label) in ["Details", "Comments", "Worklogs", "Attachments"]
+    for (index, label) in ["Details", "Comments", "Worklogs", "Attachments", "Activity"]
         .iter()
         .enumerate()
     {
@@ -341,16 +367,36 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
                 )
             })
             .collect(),
+        4 => app
+            .activity_entries()
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} · {} · {}",
+                    parse_started(&e.at)
+                        .map(|t| t.format("%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| e.at.clone()),
+                    e.author,
+                    e.kind.label()
+                )
+            })
+            .collect(),
         _ => details
             .attachments
             .iter()
             .map(|a| a.filename.clone())
             .collect(),
     };
-    list(frame, rows[0], &labels, app.item, "Entries");
+    let title = if app.detail_tab == 4 {
+        format!("Activity · {} · f filter", app.activity_filter.label())
+    } else {
+        "Entries".into()
+    };
+    list(frame, rows[0], &labels, app.item, &title);
     let body=match app.detail_tab{
         1=>details.comments.get(app.item).map(|c|format!("{}\n{}\n\n{}\n\np quote reply · e replaces formatting",c.author,c.created,c.text)),
         2=>details.worklogs.get(app.item).map(|l|format!("{} · {}\n{}\n\n{}\n\ne edit · D delete",l.author,duration_text(l.seconds),l.started,l.text)),
+        4=>app.activity_entries().get(app.item).map(|e|format!("{} · {}\n{}\n{}\n\n{}\n\nn new · p quote comment · e edit · D delete · f filter",e.kind.label(),e.author,e.at,e.title,e.body)),
         _=>details.attachments.get(app.item).map(|a|format!("{}\n{} · {} KiB\n\nEnter downloads securely and previews the file.\nPNG images use Herdr pane graphics when enabled; otherwise your system viewer opens.\n\no opens the ticket in Jira.",a.filename,a.mime,a.size/1024)),
     }.unwrap_or_else(||"No entries yet.\n\nn adds a comment/worklog; attachments are managed in Jira.".into());
     frame.render_widget(
@@ -360,6 +406,88 @@ fn draw_details(frame: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
             .scroll((app.scroll, 0)),
         rows[1],
     );
+}
+
+fn draw_notifications(frame: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
+    let outer = block(
+        format!("Activity inbox · {} unread", app.notifications.unread()),
+        true,
+    );
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(inner);
+    let mut status = format!(
+        "{} · {}s polling · {}. Initial load is quiet.",
+        if app.notifications.config.enabled {
+            "Selected board"
+        } else {
+            "Polling disabled"
+        },
+        app.notifications.config.interval_seconds,
+        if app.notifications.muted {
+            "toasts muted"
+        } else {
+            "Herdr toasts enabled"
+        }
+    );
+    for warning in [
+        &app.notifications.warning,
+        &app.notifications.delivery_warning,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        status.push('\n');
+        status.push_str(warning);
+    }
+    frame.render_widget(
+        Paragraph::new(status)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(MUTED)),
+        rows[0],
+    );
+    if app.notifications.inbox.is_empty() {
+        frame.render_widget(Paragraph::new("No new activity yet.\nKeep this plugin running to monitor the selected board.\nN opens this inbox.").style(Style::default().fg(MUTED)),rows[1]);
+        return;
+    }
+    let capacity = rows[1].height as usize / 2;
+    let first = app.item.saturating_sub(capacity.saturating_sub(1));
+    for (index, notice) in app
+        .notifications
+        .inbox
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(capacity)
+    {
+        let rect = Rect::new(
+            rows[1].x,
+            rows[1].y + ((index - first) * 2) as u16,
+            rows[1].width,
+            2,
+        );
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} {} · {}\n   {}",
+                if notice.unread { "●" } else { " " },
+                notice.key,
+                parse_started(&notice.at)
+                    .map(|t| t.format("%m-%d %H:%M").to_string())
+                    .unwrap_or_default(),
+                notice.body
+            ))
+            .style(if index == app.item {
+                selected()
+            } else {
+                base()
+            }),
+            rect,
+        );
+        hits.notices.push((rect, index));
+    }
 }
 
 fn draw_calendar_view(frame: &mut Frame, area: Rect, app: &App, hits: &mut Hits) {
@@ -574,13 +702,17 @@ fn draw_dialog(frame: &mut Frame, area: Rect, app: &App, dialog: &Dialog, hits: 
             let lines = form.value.lines().count().max(1);
             let scroll = lines.saturating_sub(regions[0].height as usize) as u16;
             frame.render_widget(
-                Paragraph::new(crate::input::display(&form.value, form.cursor))
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0)),
+                Paragraph::new(if matches!(form.kind, TextKind::Comment(_)) {
+                    crate::mentions::display(&form.value, form.cursor)
+                } else {
+                    crate::input::display(&form.value, form.cursor)
+                })
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
                 regions[0],
             );
             let footer = if matches!(form.kind, TextKind::Comment(_)) {
-                "Enter newline · Ctrl+S / Ctrl+Enter saves · Esc cancels\nMentions: @{accountId|Display name}. Editing replaces rich formatting."
+                "Enter newline · Ctrl+S / Ctrl+Enter saves · Esc cancels\nType @ to find people · ↑↓ select · Enter tags · Esc dismisses suggestions."
             } else {
                 "Enter saves · Esc cancels · Backspace edits"
             };
@@ -595,7 +727,25 @@ fn draw_dialog(frame: &mut Frame, area: Rect, app: &App, dialog: &Dialog, hits: 
             frame.render_widget(Paragraph::new(format!("Delete {kind} {id} on {key}?\n\nThis cannot be undone. Jira permissions still apply.\nEnter / y confirms · Esc cancels")).wrap(Wrap{trim:false}),regions[0]);
         }
         Dialog::Help => {
-            let mut help=String::from("BOARD\nArrows navigate · Enter opens · Shift+Left/Right moves\nShift+Up/Down ranks · m transition picker · drag cards to move\nDouble-click opens · / filters loaded tickets · b board picker\n\nWORKLOGS\nw opens date calendar + time + duration + description\nTab changes field · arrows select date · PgUp/PgDn month\nCtrl+S / Ctrl+Enter saves · Esc cancels · mouse selects dates/fields\ng worklog calendar · a mine/team · v week/month · j/k entry\n\nTICKETS\nTab changes panel · n adds · e edits · p quoted reply + mention\nD confirms deletion · l labels · i attachments · o Jira browser\nPgUp/PgDn scroll text · r refresh · Esc returns · q quits\n\nOnly supported Jira operations are native; complex workflow forms\nand rich-text/image uploads remain available through o browser.");
+            let mut help = String::from(concat!(
+                "ACTIVITY & ALERTS\n",
+                "a opens activity · f filters · N opens the activity inbox\n",
+                "Inbox: Enter opens/marks read · a marks all read · m mutes toasts\n",
+                "Alerts watch the selected board while this workspace runs.\n\n",
+                "TAG PEOPLE\n",
+                "@ browses visible users; type a name to search\n",
+                "↑↓ selects · Enter/Tab tags · PgDn more · Esc dismisses picker\n\n",
+                "BOARD\n",
+                "Arrows navigate · Enter/double-click opens · / filters · b boards\n",
+                "Shift+Left/Right moves · Shift+Up/Down ranks · m transitions\n\n",
+                "WORKLOGS\n",
+                "w logs work · Tab field · arrows date · PgUp/PgDn month\n",
+                "g calendar · a mine/team · v week/month · j/k selects entry\n\n",
+                "TICKETS & FORMS\n",
+                "Tab panel · n adds · e edits · p quote-replies · D confirms delete\n",
+                "Ctrl+S / Ctrl+Enter saves · Esc cancels · Ctrl+U clears field\n",
+                "l labels · i attachments · o browser · r refresh · q quits"
+            ));
             if !app.calendar_warnings.is_empty() {
                 help.push_str("\n\nIncomplete calendar: ");
                 help.push_str(&app.calendar_warnings.join("; "));
@@ -683,6 +833,66 @@ fn draw_dialog(frame: &mut Frame, area: Rect, app: &App, dialog: &Dialog, hits: 
     }
 }
 
+fn draw_mentions(frame: &mut Frame, area: Rect, picker: &crate::mentions::Picker, hits: &mut Hits) {
+    let rect = centered(area, 64, area.height.saturating_sub(4).min(14));
+    frame.render_widget(Clear, rect);
+    let outer = block(
+        format!(
+            "Tag a person · @{} · {} loaded",
+            picker.context.query,
+            picker.users.len()
+        ),
+        true,
+    );
+    let inner = outer.inner(rect);
+    frame.render_widget(outer, rect);
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(inner);
+    let first = picker
+        .index
+        .saturating_sub(regions[0].height.saturating_sub(1) as usize);
+    for (index, user) in picker
+        .users
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(regions[0].height as usize)
+    {
+        let row = Rect::new(
+            regions[0].x,
+            regions[0].y + (index - first) as u16,
+            regions[0].width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(user.name.clone()).style(if index == picker.index {
+                selected()
+            } else {
+                base()
+            }),
+            row,
+        );
+        hits.mentions.push((row, index));
+    }
+    let note = if let Some(error) = &picker.error {
+        error.clone()
+    } else if picker.loading || picker.needs_fetch {
+        "Searching Jira users…".into()
+    } else if picker.users.is_empty() {
+        "No visible active users. Try a name; check Browse users and groups permission.".into()
+    } else {
+        format!("↑↓ choose · Enter/Tab tags · Esc returns to draft\n{} · type to search; clear query to browse",if picker.more{"PgDn loads more users"}else{"End of results"})
+    };
+    frame.render_widget(
+        Paragraph::new(note)
+            .style(Style::default().fg(if picker.error.is_some() { WARN } else { MUTED }))
+            .wrap(Wrap { trim: false }),
+        regions[1],
+    );
+}
+
 fn draw_worklog(frame: &mut Frame, area: Rect, app: &App, form: &WorklogForm, hits: &mut Hits) {
     let rect = centered(area, 94, 28);
     frame.render_widget(Clear, rect);
@@ -751,7 +961,7 @@ fn draw_worklog(frame: &mut Frame, area: Rect, app: &App, form: &WorklogForm, hi
     for (index, title, value) in [
         (1, "Start time · HH:MM", form.time.as_str()),
         (2, "Time spent · e.g. 1h 30m", form.duration.as_str()),
-        (3, "Work description · Enter newline", form.comment.as_str()),
+        (3, "Work description · @ to tag", form.comment.as_str()),
         (4, "Remaining estimate · ←→ cycles", form.estimate.as_str()),
         (
             5,
@@ -768,7 +978,13 @@ fn draw_worklog(frame: &mut Frame, area: Rect, app: &App, form: &WorklogForm, hi
                 5 => form.cursors[3],
                 _ => value.len(),
             };
-            crate::input::display(value, cursor)
+            if index == 3 {
+                crate::mentions::display(value, cursor)
+            } else {
+                crate::input::display(value, cursor)
+            }
+        } else if index == 3 {
+            crate::jira::mention_preview(value)
         } else {
             value.into()
         };
@@ -857,7 +1073,7 @@ mod tests {
         let key =
             |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         app.on_key(key(crossterm::event::KeyCode::Enter));
-        for tab in 0..4 {
+        for tab in 0..5 {
             app.detail_tab = tab;
             let text = render(&app, 120, 40);
             assert!(text.contains("DEMO-1"));
@@ -896,6 +1112,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn activity_mentions_and_notification_panels_render_without_losing_drafts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut app = App::new(tx, true);
+        app.on_key(key(KeyCode::Enter));
+        assert!(render(&app, 120, 40).contains("Activity · All"));
+        app.on_key(key(KeyCode::Char('N')));
+        assert!(render(&app, 120, 40).contains("Activity inbox"));
+        for (w, h) in [(40, 14), (62, 24), (80, 24), (120, 40)] {
+            render(&app, w, h);
+        }
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('c')));
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_paste("Keep this draft @Sa");
+        app.tick(std::time::Instant::now() + std::time::Duration::from_secs(1));
+        let text = render(&app, 120, 40);
+        assert!(text.contains("Tag a person"));
+        assert!(text.contains("Samir Khanal"));
+        for (w, h) in [(40, 14), (62, 24), (80, 24), (120, 40)] {
+            render(&app, w, h);
+        }
+        let Some(Dialog::Text(form)) = &app.dialog else {
+            panic!("Draft lost");
+        };
+        assert_eq!(form.value, "Keep this draft @Sa");
+    }
     #[test]
     fn resize_and_empty_boards_never_panic() {
         let (tx, _) = std::sync::mpsc::channel();

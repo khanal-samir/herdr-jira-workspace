@@ -16,6 +16,7 @@ pub struct Issue {
     pub description: String,
     pub url: String,
     pub time_spent: i64,
+    pub updated: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -48,7 +49,9 @@ pub struct Comment {
     pub author: String,
     pub account_id: String,
     pub created: String,
+    pub updated: String,
     pub text: String,
+    pub editable_text: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,8 +61,11 @@ pub struct Worklog {
     pub author: String,
     pub account_id: String,
     pub started: String,
+    pub created: String,
+    pub updated: String,
     pub seconds: i64,
     pub text: String,
+    pub editable_text: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,6 +83,7 @@ pub struct Details {
     pub comments: Vec<Comment>,
     pub worklogs: Vec<Worklog>,
     pub attachments: Vec<Attachment>,
+    pub activity: Vec<crate::activity::Entry>,
     pub warnings: Vec<String>,
 }
 
@@ -97,7 +104,8 @@ pub struct JiraClient {
     cloud: bool,
 }
 
-const FIELDS: &str = "summary,status,issuetype,priority,assignee,labels,description,timetracking";
+const FIELDS: &str =
+    "summary,status,issuetype,priority,assignee,labels,description,timetracking,updated";
 
 fn text(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_string()
@@ -349,6 +357,7 @@ impl JiraClient {
         Issue {
             url: format!("{}/browse/{key}", self.base),
             key,
+            updated: text(&f["updated"]),
             summary: text(&f["summary"]),
             status: text(&f["status"]["name"]),
             status_id: id(&f["status"]["id"]),
@@ -404,7 +413,9 @@ impl JiraClient {
                     author: person(&v["author"]),
                     account_id: self.person_id(&v["author"]),
                     created: text(&v["created"]),
+                    updated: text(&v["updated"]),
                     text: document_text(&v["body"]),
+                    editable_text: document_edit_text(&v["body"]),
                 })
                 .collect(),
             Err(error) => {
@@ -419,13 +430,107 @@ impl JiraClient {
                 Vec::new()
             }
         };
+        let history = match self.history(key) {
+            Ok((entries, warning)) => {
+                if let Some(warning) = warning {
+                    warnings.push(warning);
+                }
+                entries
+            }
+            Err(error) => {
+                warnings.push(format!("History unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let activity = crate::activity::timeline(&comments, &worklogs, history);
         Ok(Details {
+            activity,
             issue: self.parse_issue(&issue),
             attachments,
             comments,
             worklogs,
             warnings,
         })
+    }
+
+    pub fn history(
+        &self,
+        key: &str,
+    ) -> Result<(Vec<crate::activity::Entry>, Option<String>), String> {
+        let (values, warning) = if self.cloud {
+            (
+                self.pages(
+                    &format!("/rest/api/3/issue/{key}/changelog"),
+                    "values",
+                    false,
+                    &[],
+                )?,
+                None,
+            )
+        } else {
+            let issue = self.request(
+                "GET",
+                &format!("/rest/api/2/issue/{key}"),
+                &[("expand", "changelog".into()), ("fields", "summary".into())],
+                None,
+            )?;
+            let changelog = &issue["changelog"];
+            let values = changelog["histories"]
+                .as_array()
+                .ok_or("Jira response has no changelog histories")?
+                .clone();
+            let partial = changelog["total"]
+                .as_u64()
+                .is_some_and(|n| n > values.len() as u64)
+                || changelog["startAt"].as_u64().is_some_and(|n| n > 0)
+                || changelog["isLast"].as_bool() == Some(false);
+            let warning=partial.then(||"History INCOMPLETE: this Jira server truncated its changelog expansion; see older changes in Jira".into());
+            (values, warning)
+        };
+        Ok((
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, v)| {
+                    let changes: Vec<_> = v["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|item| {
+                            format!(
+                                "{}: {} → {}",
+                                item["field"].as_str().unwrap_or("Field"),
+                                item["fromString"]
+                                    .as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("None"),
+                                item["toString"]
+                                    .as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("None")
+                            )
+                        })
+                        .collect();
+                    crate::activity::Entry {
+                        id: format!("history:{}:{index}", id(&v["id"])),
+                        resource_id: id(&v["id"]),
+                        kind: crate::activity::Kind::History,
+                        at: text(&v["created"]),
+                        author: person(&v["author"]),
+                        title: if changes.len() == 1 {
+                            format!(
+                                "{} changed",
+                                v["items"][0]["field"].as_str().unwrap_or("Field")
+                            )
+                        } else {
+                            format!("Changed {} fields", changes.len())
+                        },
+                        body: changes.join("\n"),
+                    }
+                })
+                .collect(),
+            warning,
+        ))
     }
 
     fn person_id(&self, person: &Value) -> String {
@@ -515,6 +620,53 @@ impl JiraClient {
         Ok(())
     }
 
+    pub fn user_page(
+        &self,
+        query: &str,
+        start: usize,
+    ) -> Result<crate::mentions::UserPage, String> {
+        const SIZE: usize = 50;
+        let path = if self.cloud && query.is_empty() {
+            "/rest/api/3/users/search".into()
+        } else {
+            format!("/rest/api/{}/user/search", self.api())
+        };
+        let mut params = vec![
+            ("startAt", start.to_string()),
+            ("maxResults", SIZE.to_string()),
+        ];
+        if !query.is_empty() || !self.cloud {
+            params.push((if self.cloud { "query" } else { "username" }, query.into()));
+        }
+        if !self.cloud {
+            params.extend([
+                ("includeActive", "true".into()),
+                ("includeInactive", "false".into()),
+            ]);
+        }
+        let page = self.request("GET", &path, &params, None)?;
+        let values = page
+            .as_array()
+            .ok_or("Jira returned an invalid user directory")?;
+        Ok(crate::mentions::UserPage {
+            users: values
+                .iter()
+                .filter(|v| {
+                    v["active"].as_bool() != Some(false) && v["accountType"].as_str() != Some("app")
+                })
+                .filter_map(|v| {
+                    let account_id = self.person_id(v);
+                    (!account_id.is_empty()).then(|| crate::mentions::User {
+                        account_id,
+                        name: person(v),
+                    })
+                })
+                .collect(),
+            more: values.len() >= SIZE,
+            next_offset: start + values.len(),
+        })
+    }
+
     pub fn priorities(&self) -> Result<Vec<(String, String)>, String> {
         let values = self.request(
             "GET",
@@ -596,7 +748,17 @@ impl JiraClient {
 
     fn document(&self, value: &str) -> Value {
         if !self.cloud {
-            return json!(value);
+            let wiki = mention_nodes(value)
+                .iter()
+                .map(|node| {
+                    if node["type"] == "mention" {
+                        format!("[~{}]", node["attrs"]["id"].as_str().unwrap_or_default())
+                    } else {
+                        text(&node["text"])
+                    }
+                })
+                .collect::<String>();
+            return json!(wiki);
         }
         json!({"type":"doc","version":1,"content":value.split('\n').map(|line| {
             if line.is_empty() { json!({"type":"paragraph","content":[]}) }
@@ -642,8 +804,11 @@ impl JiraClient {
                 author: person(&v["author"]),
                 account_id: self.person_id(&v["author"]),
                 started: text(&v["started"]),
+                created: text(&v["created"]),
+                updated: text(&v["updated"]),
                 seconds: v["timeSpentSeconds"].as_i64().unwrap_or(0),
                 text: document_text(&v["comment"]),
+                editable_text: document_edit_text(&v["comment"]),
             })
             .collect())
     }
@@ -752,6 +917,41 @@ impl JiraClient {
         }
         Ok(bytes)
     }
+}
+
+pub fn mention_preview(value: &str) -> String {
+    mention_nodes(value)
+        .iter()
+        .map(|node| {
+            if node["type"] == "mention" {
+                text(&node["attrs"]["text"])
+            } else {
+                text(&node["text"])
+            }
+        })
+        .collect()
+}
+fn document_edit_text(value: &Value) -> String {
+    fn restore(value: &mut Value) {
+        if value["type"] == "mention" {
+            let account = text(&value["attrs"]["id"]);
+            let name = text(&value["attrs"]["text"])
+                .trim_start_matches('@')
+                .replace(['{', '}', '|'], "");
+            if !account.is_empty() {
+                *value = json!({"type":"text","text":format!("@{{{account}|{name}}}")});
+                return;
+            }
+        }
+        if let Some(children) = value.get_mut("content").and_then(Value::as_array_mut) {
+            for child in children {
+                restore(child);
+            }
+        }
+    }
+    let mut value = value.clone();
+    restore(&mut value);
+    document_text(&value)
 }
 
 fn mention_nodes(mut line: &str) -> Vec<Value> {

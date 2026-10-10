@@ -8,7 +8,7 @@ use std::os::unix::{
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -39,6 +39,10 @@ fn open(target: &str) -> Result<(), String> {
 fn graphics(method: &str, params: Value) -> Result<Value, String> {
     let socket =
         std::env::var("HERDR_SOCKET_PATH").map_err(|_| "Herdr socket unavailable".to_string())?;
+    request_at(Path::new(&socket), method, params)
+}
+
+fn request_at(socket: &Path, method: &str, params: Value) -> Result<Value, String> {
     let mut stream =
         UnixStream::connect(socket).map_err(|_| "Could not connect to Herdr".to_string())?;
     stream
@@ -47,7 +51,7 @@ fn graphics(method: &str, params: Value) -> Result<Value, String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|_| "Could not configure socket".to_string())?;
-    let request = json!({"id":"jira-workspace-graphics","method":method,"params":params});
+    let request = json!({"id":"jira-workspace","method":method,"params":params});
     writeln!(stream, "{request}").map_err(|_| "Could not send graphics request".to_string())?;
     let mut response = String::new();
     BufReader::new(stream)
@@ -55,10 +59,26 @@ fn graphics(method: &str, params: Value) -> Result<Value, String> {
         .map_err(|_| "Herdr graphics response timed out".to_string())?;
     let value: Value =
         serde_json::from_str(&response).map_err(|_| "Invalid graphics response".to_string())?;
-    if value["ok"].as_bool() != Some(true) {
-        return Err("Herdr pane graphics unavailable or disabled".into());
+    if value.get("error").is_some() || value.get("result").is_none() {
+        return Err("Herdr request unavailable or rejected".into());
     }
     Ok(value["result"].clone())
+}
+
+pub fn notify(title: &str, body: &str) -> Result<bool, String> {
+    let socket =
+        std::env::var("HERDR_SOCKET_PATH").map_err(|_| "Herdr socket unavailable".to_string())?;
+    notify_at(Path::new(&socket), title, body)
+}
+fn notify_at(socket: &Path, title: &str, body: &str) -> Result<bool, String> {
+    let value = request_at(
+        socket,
+        "notification.show",
+        json!({"title":title,"body":body,"sound":"none"}),
+    )?;
+    value["shown"]
+        .as_bool()
+        .ok_or("Invalid Herdr notification response".into())
 }
 
 pub fn clear_graphics() -> Result<(), String> {
@@ -143,6 +163,34 @@ pub fn show_attachment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_toast_uses_result_envelope_and_respects_delivery_policy() {
+        for shown in [true, false] {
+            let path = std::env::temp_dir().join(format!(
+                "jira-notify-{}-{}",
+                std::process::id(),
+                chrono::Local::now().timestamp_nanos_opt().unwrap()
+            ));
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], "notification.show");
+                assert_eq!(
+                    request["params"],
+                    json!({"title":"Jira","body":"Update","sound":"none"})
+                );
+                writeln!(stream,"{}",json!({"id":request["id"],"result":{"shown":shown,"reason":if shown{"shown"}else{"busy"}}})).unwrap();
+            });
+            assert_eq!(notify_at(&path, "Jira", "Update").unwrap(), shown);
+            server.join().unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+    }
     #[test]
     fn png_headers_are_validated_before_rendering() {
         assert!(png_dimensions(b"not a png").is_none());

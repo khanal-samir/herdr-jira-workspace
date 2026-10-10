@@ -442,6 +442,7 @@ fn restricted_comments_or_disabled_worklogs_do_not_hide_ticket_details() {
                     json!({"errorMessages":["Time tracking disabled"]}),
                 )
             },
+            get("/changelog", json!({"values":[],"total":0})),
         ],
         true,
     );
@@ -510,6 +511,164 @@ fn network_failures_on_writes_warn_against_duplicate_retries() {
         .save_comment("X-1", None, "Hello")
         .unwrap_err()
         .contains("outcome unknown"));
+}
+#[test]
+fn activity_history_fetches_every_page_and_keeps_field_changes() {
+    let (c, h) = server(
+        vec![
+            get(
+                "/rest/api/3/issue/X-1/changelog",
+                json!({"values":[{"id":"7","created":"2026-10-10T10:00:00.000+0000","author":{"displayName":"Alex","accountId":"alex"},"items":[{"field":"status","fromString":"To do","toString":"In progress"}]}],"total":2}),
+            ),
+            get(
+                "startAt=1",
+                json!({"values":[{"id":"8","created":"2026-10-10T11:00:00.000+0000","items":[{"field":"labels","fromString":null,"toString":"calendar"}]}],"total":2}),
+            ),
+        ],
+        true,
+    );
+    let (entries, warning) = c.history("X-1").unwrap();
+    assert!(warning.is_none());
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].body.contains("To do → In progress"));
+    assert_eq!(entries[0].author, "Alex");
+    h.join().unwrap();
+}
+
+#[test]
+fn bare_at_browses_directory_and_search_uses_the_cloud_query() {
+    let (c, h) = server(
+        vec![
+            get(
+                "/rest/api/3/users/search?startAt=0",
+                json!([{"accountId":"alex","displayName":"Alex","active":true},{"accountId":"app","displayName":"App","active":true,"accountType":"app"},{"accountId":"gone","displayName":"Gone","active":false}]),
+            ),
+            get(
+                "query=Samir",
+                json!([{"accountId":"samir","displayName":"Samir","active":true}]),
+            ),
+        ],
+        true,
+    );
+    let page = c.user_page("", 0).unwrap();
+    assert_eq!(page.users.len(), 1);
+    assert_eq!(page.users[0].name, "Alex");
+    assert_eq!(
+        c.user_page("Samir", 0).unwrap().users[0].account_id,
+        "samir"
+    );
+    h.join().unwrap();
+}
+
+#[test]
+fn data_center_history_marks_truncated_expansions_incomplete() {
+    let (c, h) = server(
+        vec![get(
+            "expand=changelog",
+            json!({"changelog":{"histories":[{"id":"1","created":"2026-10-10T00:00:00Z","author":{"displayName":"A"},"items":[{"field":"assignee","fromString":null,"toString":"Samir"}]}],"total":200}}),
+        )],
+        false,
+    );
+    let (entries, warning) = c.history("X-1").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(warning.unwrap().contains("INCOMPLETE"));
+    assert!(entries[0].body.contains("None → Samir"));
+    h.join().unwrap();
+}
+#[test]
+fn history_permission_failures_are_not_an_empty_history() {
+    let (c, h) = server(
+        vec![Expected {
+            status: 403,
+            ..get(
+                "/changelog",
+                json!({"errorMessages":["Restricted history"]}),
+            )
+        }],
+        true,
+    );
+    assert!(c.history("X-1").unwrap_err().contains("Restricted history"));
+    h.join().unwrap();
+}
+#[test]
+fn directory_paging_uses_raw_page_size_even_when_some_accounts_are_hidden() {
+    let users:Vec<_>=(0..50).map(|i|json!({"accountId":i.to_string(),"displayName":format!("User {i}"),"active":i%2==0})).collect();
+    let (c, h) = server(vec![get("startAt=50", json!(users))], true);
+    let page = c.user_page("", 50).unwrap();
+    assert_eq!(page.users.len(), 25);
+    assert_eq!(page.next_offset, 100);
+    assert!(page.more);
+    h.join().unwrap();
+}
+#[test]
+fn data_center_lookup_and_mentions_use_usernames_not_cloud_account_ids() {
+    let (c, h) = server(
+        vec![
+            get(
+                "username=Samir",
+                json!([{"name":"samir","displayName":"Samir","active":true}]),
+            ),
+            mutation(
+                "POST",
+                "/rest/api/2/issue/X-1/comment",
+                json!({"body":"Hi [~samir]"}),
+            ),
+        ],
+        false,
+    );
+    assert_eq!(
+        c.user_page("Samir", 0).unwrap().users[0].account_id,
+        "samir"
+    );
+    c.save_comment("X-1", None, "Hi @{samir|Samir}").unwrap();
+    h.join().unwrap();
+}
+#[test]
+fn editing_comment_text_preserves_existing_real_mentions() {
+    let body = json!({"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"Hi "},{"type":"mention","attrs":{"id":"id:42","text":"@Samir"}}]}]});
+    let editable = document_edit_text(&body);
+    assert_eq!(editable, "Hi @{id:42|Samir}");
+    let (c, h) = server(
+        vec![mutation(
+            "PUT",
+            "/rest/api/3/issue/X-1/comment/7",
+            json!({"body":body}),
+        )],
+        true,
+    );
+    c.save_comment("X-1", Some("7"), &editable).unwrap();
+    h.join().unwrap();
+}
+#[test]
+fn user_directory_permission_errors_do_not_reveal_credentials() {
+    let (c, h) = server(
+        vec![Expected {
+            status: 403,
+            ..get(
+                "/users/search",
+                json!({"errorMessages":["Missing Browse users and groups"]}),
+            )
+        }],
+        true,
+    );
+    let error = c.user_page("", 0).unwrap_err();
+    assert!(error.contains("Browse users"));
+    assert!(!error.contains("test-only-token"));
+    h.join().unwrap();
+}
+#[test]
+fn data_center_plain_worklog_comments_remain_safe_to_edit() {
+    let (c, h) = server(
+        vec![get(
+            "/worklog",
+            json!({"worklogs":[{"id":"9","comment":"Plain work description","started":"2026-10-10T09:00:00.000+0000","timeSpentSeconds":3600,"author":{"name":"samir","displayName":"Samir"}}],"total":1}),
+        )],
+        false,
+    );
+    let logs = c.worklogs("X-1").unwrap();
+    assert_eq!(logs[0].editable_text, "Plain work description");
+    assert_eq!(logs[0].account_id, "samir");
+    h.join().unwrap();
 }
 #[test]
 fn ranking_sends_the_board_rank_field_and_neighbor() {

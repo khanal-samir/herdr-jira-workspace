@@ -1,9 +1,12 @@
+mod activity;
 mod app;
 mod calendar;
 mod config;
 mod input;
 mod integrations;
 mod jira;
+mod mentions;
+mod notifications;
 mod ui;
 
 use app::{App, Response};
@@ -77,6 +80,7 @@ fn main() -> io::Result<()> {
         while let Ok(response) = rx.try_recv() {
             app.on_message(response);
         }
+        app.tick(std::time::Instant::now());
         terminal.draw(|f| {
             let area = f.area();
             app.dimensions = (area.width, area.height);

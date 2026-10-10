@@ -19,6 +19,7 @@ pub enum View {
     Details,
     Calendar,
     Image,
+    Notifications,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +58,15 @@ impl WorklogForm {
     pub fn new(key: String, date: Option<NaiveDate>, log: Option<&Worklog>) -> Self {
         let started = log.and_then(|l| parse_started(&l.started));
         let duration = log.map(|l| duration_text(l.seconds)).unwrap_or_default();
-        let comment = log.map(|l| l.text.clone()).unwrap_or_default();
+        let comment = log
+            .map(|l| {
+                if l.editable_text.is_empty() {
+                    l.text.clone()
+                } else {
+                    l.editable_text.clone()
+                }
+            })
+            .unwrap_or_default();
         let cursors = [5, duration.len(), comment.len(), 0];
         Self {
             key,
@@ -117,8 +126,15 @@ pub struct Response {
     pub result: Result<Data, String>,
 }
 
+pub enum Background {
+    Users(u64, Result<crate::mentions::UserPage, String>),
+    Poll(u64, Result<Board, String>),
+    Delivery(Result<bool, String>),
+}
+
 pub enum Data {
-    Connected(JiraClient, u64),
+    Background(Box<Background>),
+    Connected(JiraClient, u64, crate::config::NotificationsConfig),
     Boards(Vec<Board>),
     Board(Board),
     Details(Box<Details>),
@@ -137,6 +153,9 @@ pub struct Hits {
     pub fields: Vec<(Rect, usize)>,
     pub tabs: Vec<(Rect, usize)>,
     pub picker: Vec<(Rect, usize)>,
+    pub mentions: Vec<(Rect, usize)>,
+    pub notification: Option<Rect>,
+    pub notices: Vec<(Rect, usize)>,
 }
 
 pub struct App {
@@ -147,6 +166,7 @@ pub struct App {
     pub search: String,
     pub details: Option<Details>,
     pub detail_tab: usize,
+    pub activity_filter: crate::activity::Filter,
     pub item: usize,
     pub scroll: u16,
     pub calendar: Calendar,
@@ -157,7 +177,13 @@ pub struct App {
     pub calendar_item: usize,
     pub calendar_warnings: Vec<String>,
     pub dialog: Option<Dialog>,
+    pub mentions: Option<crate::mentions::Picker>,
+    mention_version: u64,
+    mention_inflight: Option<u64>,
+    mention_dismissed: Option<crate::mentions::Context>,
     pub busy: bool,
+    pub notifications: crate::notifications::Monitor,
+    toast_owner: Option<std::fs::File>,
     pending_write: bool,
     generation: u64,
     pub notice: String,
@@ -183,6 +209,7 @@ impl App {
             search: String::new(),
             details: None,
             detail_tab: 0,
+            activity_filter: crate::activity::Filter::All,
             item: 0,
             scroll: 0,
             calendar: Calendar::default(),
@@ -193,7 +220,19 @@ impl App {
             calendar_item: 0,
             calendar_warnings: Vec::new(),
             dialog: None,
+            mentions: None,
+            mention_version: 0,
+            mention_inflight: None,
+            mention_dismissed: None,
             busy: false,
+            notifications: crate::notifications::Monitor::new(
+                crate::config::NotificationsConfig {
+                    enabled: !demo,
+                    ..Default::default()
+                },
+                Instant::now(),
+            ),
+            toast_owner: None,
             pending_write: false,
             generation: 0,
             notice: String::new(),
@@ -210,13 +249,24 @@ impl App {
         };
         if demo {
             app.board = demo_board();
+            app.notifications.observe(&app.board, Instant::now());
+            app.notifications
+                .inbox
+                .push_front(crate::notifications::Notice {
+                    key: "DEMO-1".into(),
+                    title: "Jira · DEMO-1".into(),
+                    body: "Demo: Alex added a comment · Enter opens activity".into(),
+                    at: Local::now().to_rfc3339(),
+                    unread: true,
+                });
             app.notice = "DEMO · local-only interactions · no Jira requests".into();
         } else {
             app.busy = true;
             app.notice = "Connecting to Jira…".into();
             std::thread::spawn(move || {
                 let result = Config::load().and_then(|cfg| {
-                    JiraClient::new(&cfg).map(|client| Data::Connected(client, cfg.board_id))
+                    JiraClient::new(&cfg)
+                        .map(|client| Data::Connected(client, cfg.board_id, cfg.notifications))
                 });
                 let _ = tx.send(Response {
                     generation: 0,
@@ -261,17 +311,27 @@ impl App {
     }
 
     pub fn on_message(&mut self, response: Response) {
-        if response.generation == self.generation {
+        if matches!(&response.result, Ok(Data::Background(_)))
+            || response.generation == self.generation
+        {
             self.on_response(response.result);
         }
     }
 
     pub fn on_response(&mut self, result: Result<Data, String>) {
+        if let Ok(Data::Background(event)) = result {
+            self.on_background(*event);
+            return;
+        }
         self.busy = false;
         self.pending_write = false;
         match result {
             Err(error) => self.fail(&error),
-            Ok(Data::Connected(client, board_id)) => {
+            Ok(Data::Background(_)) => {
+                unreachable!("Background responses are handled before foreground state")
+            }
+            Ok(Data::Connected(client, board_id, config)) => {
+                self.notifications.config = config;
                 self.client = Some(client);
                 if board_id == 0 {
                     self.choose_board();
@@ -284,26 +344,13 @@ impl App {
                 self.error = false;
                 self.dialog = Some(Dialog::Boards { boards, index: 0 });
             }
-            Ok(Data::Board(mut board)) => {
+            Ok(Data::Board(board)) => {
+                let board = mapped_board(board);
                 let key = self.selected_issue().map(|i| i.key.clone());
-                let mapped: Vec<String> = board
-                    .columns
-                    .iter()
-                    .flat_map(|c| c.statuses.clone())
-                    .collect();
-                let unmapped: Vec<String> = board
-                    .issues
-                    .iter()
-                    .filter(|i| !mapped.contains(&i.status_id))
-                    .map(|i| i.status_id.clone())
-                    .collect();
-                if !unmapped.is_empty() {
-                    board.columns.push(Column {
-                        name: "Unmapped".into(),
-                        statuses: unmapped,
-                        max: None,
-                    });
+                if self.notifications.board_id != board.id {
+                    self.toast_owner = None;
                 }
+                self.notifications.observe(&board, Instant::now());
                 self.board = board;
                 self.dialog = None;
                 self.error = false;
@@ -332,6 +379,7 @@ impl App {
                 {
                     *issue = details.issue.clone();
                 }
+                self.notifications.sync_issue(&details.issue);
                 self.details = Some(details);
                 self.view = View::Details;
                 self.clamp_item();
@@ -377,6 +425,7 @@ impl App {
             Ok(Data::Saved(key)) => {
                 self.dialog = None;
                 self.error = false;
+                self.notifications.quiet(key.clone());
                 self.notice = format!("Saved {key} to Jira");
                 self.refresh();
             }
@@ -400,6 +449,208 @@ impl App {
                     Err(error) => self.fail(&error),
                 }
             }
+        }
+    }
+
+    fn composer(&mut self) -> Option<(&mut String, &mut usize)> {
+        match self.dialog.as_mut() {
+            Some(Dialog::Text(form)) if matches!(form.kind, TextKind::Comment(_)) => {
+                Some((&mut form.value, &mut form.cursor))
+            }
+            Some(Dialog::Worklog(form)) if form.field == 3 => {
+                Some((&mut form.comment, &mut form.cursors[2]))
+            }
+            _ => None,
+        }
+    }
+    fn sync_mentions(&mut self) {
+        let context = self
+            .composer()
+            .and_then(|(value, cursor)| crate::mentions::context(value, *cursor));
+        if context == self.mention_dismissed {
+            self.mentions = None;
+            return;
+        }
+        if self.mentions.as_ref().map(|p| &p.context) == context.as_ref() {
+            return;
+        }
+        self.mention_version += 1;
+        self.mentions = context.map(|context| {
+            crate::mentions::Picker::new(context, self.mention_version, Instant::now())
+        });
+        self.mention_dismissed = None;
+    }
+    fn select_mention(&mut self) {
+        if let Some(picker) = self.mentions.take() {
+            if let Some(user) = picker.users.get(picker.index) {
+                if let Some((value, cursor)) = self.composer() {
+                    crate::mentions::insert(value, cursor, &picker.context, user);
+                }
+            }
+        }
+        self.sync_mentions();
+    }
+    fn mention_key(&mut self, key: KeyEvent) -> bool {
+        let Some(picker) = self.mentions.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up => picker.index = picker.index.saturating_sub(1),
+            KeyCode::Down => {
+                picker.index = (picker.index + 1).min(picker.users.len().saturating_sub(1))
+            }
+            KeyCode::PageDown => picker.more(Instant::now()),
+            KeyCode::Esc => {
+                self.mention_dismissed = Some(picker.context.clone());
+                self.mentions = None;
+            }
+            KeyCode::Enter | KeyCode::Tab if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !picker.loading && !picker.users.is_empty() {
+                    self.select_mention();
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.fail(
+                    "Select a person with Enter, or Esc to dismiss @ suggestions before saving.",
+                );
+            }
+            _ => return false,
+        }
+        true
+    }
+    fn on_background(&mut self, event: Background) {
+        match event {
+            Background::Poll(version, result) => {
+                if self.busy {
+                    self.notifications.discard(version, Instant::now());
+                    return;
+                }
+                if let Some((board, notices)) =
+                    self.notifications.finish(version, result, Instant::now())
+                {
+                    if self.view == View::Board && self.dialog.is_none() {
+                        let key = self.selected_issue().map(|i| i.key.clone());
+                        self.board = mapped_board(board);
+                        self.clamp_selection();
+                        if let Some(key) = key {
+                            self.select_key(&key);
+                        }
+                    }
+                    if !notices.is_empty() && !self.notifications.muted && !self.demo {
+                        if self.toast_owner.is_none() {
+                            match crate::notifications::delivery_lock(self.notifications.board_id) {
+                                Ok(owner) => self.toast_owner = owner,
+                                Err(error) => self.notifications.delivery_warning = Some(error),
+                            }
+                        }
+                        if self.toast_owner.is_some() {
+                            if let Some((title, body)) = crate::notifications::batch(&notices) {
+                                let tx = self.tx.clone();
+                                std::thread::spawn(move || {
+                                    let result = integrations::notify(&title, &body);
+                                    let _ = tx.send(Response {
+                                        generation: 0,
+                                        result: Ok(Data::Background(Box::new(
+                                            Background::Delivery(result),
+                                        ))),
+                                    });
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            Background::Delivery(result) => {
+                self.notifications.delivery_warning = match result {
+                    Err(error) => Some(format!(
+                        "Herdr toast unavailable: {error}. Updates remain in this inbox."
+                    )),
+                    _ => None,
+                };
+            }
+            Background::Users(version, result) => {
+                if self.mention_inflight == Some(version) {
+                    self.mention_inflight = None;
+                }
+                if let Some(picker) = self.mentions.as_mut().filter(|p| p.version == version) {
+                    picker.finish(result);
+                }
+            }
+        }
+    }
+    pub fn tick(&mut self, now: Instant) {
+        if self.busy || self.should_quit {
+            return;
+        }
+        if self.mention_inflight.is_none() {
+            if let Some(picker) = self.mentions.as_mut().filter(|p| p.due(now)) {
+                picker.needs_fetch = false;
+                picker.loading = true;
+                let version = picker.version;
+                let query = picker.context.query.clone();
+                let offset = picker.offset;
+                if self.demo {
+                    picker.finish(Ok(crate::mentions::demo_users(&query)));
+                } else if let Some(client) = self.client.clone() {
+                    self.mention_inflight = Some(version);
+                    let tx = self.tx.clone();
+                    std::thread::spawn(move || {
+                        let result = client.user_page(&query, offset);
+                        let _ = tx.send(Response {
+                            generation: 0,
+                            result: Ok(Data::Background(Box::new(Background::Users(
+                                version, result,
+                            )))),
+                        });
+                    });
+                } else {
+                    picker.finish(Err("Not connected".into()));
+                }
+            }
+        }
+        if !self.demo && self.notifications.due(now) {
+            if let Some(client) = self.client.clone() {
+                let version = self.notifications.begin_poll();
+                let board_id = self.notifications.board_id;
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let result = client.board(board_id);
+                    let _ = tx.send(Response {
+                        generation: 0,
+                        result: Ok(Data::Background(Box::new(Background::Poll(
+                            version, result,
+                        )))),
+                    });
+                });
+            }
+        }
+    }
+
+    fn open_notice(&mut self) {
+        let Some(notice) = self.notifications.inbox.get_mut(self.item) else {
+            return;
+        };
+        notice.unread = false;
+        let key = notice.key.clone();
+        self.detail_tab = 4;
+        self.item = 0;
+        self.scroll = 0;
+        self.load_details(key);
+    }
+    fn notification_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('N') => self.view = View::Board,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.item = (self.item + 1).min(self.notifications.inbox.len().saturating_sub(1))
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.item = self.item.saturating_sub(1),
+            KeyCode::Enter => self.open_notice(),
+            KeyCode::Char('a') => self.notifications.mark_all_read(),
+            KeyCode::Char('m') => self.notifications.muted = !self.notifications.muted,
+            KeyCode::Char('?') => self.dialog = Some(Dialog::Help),
+            _ => {}
         }
     }
 
@@ -609,6 +860,7 @@ impl App {
             }
             View::Calendar => self.load_calendar(),
             View::Image => {}
+            View::Notifications => self.load_board(self.board.id),
         }
     }
 
@@ -746,7 +998,52 @@ impl App {
         }
     }
 
+    pub fn activity_entries(&self) -> Vec<&crate::activity::Entry> {
+        self.details
+            .as_ref()
+            .map(|d| {
+                d.activity
+                    .iter()
+                    .filter(|e| self.activity_filter.accepts(e.kind))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn activity_target(&self) -> Option<(usize, usize)> {
+        let entries = self.activity_entries();
+        let entry = entries.get(self.item)?;
+        let details = self.details.as_ref()?;
+        match entry.kind {
+            crate::activity::Kind::Comment => details
+                .comments
+                .iter()
+                .position(|c| c.id == entry.resource_id)
+                .map(|i| (1, i)),
+            crate::activity::Kind::Worklog => details
+                .worklogs
+                .iter()
+                .position(|w| w.id == entry.resource_id)
+                .map(|i| (2, i)),
+            crate::activity::Kind::History => None,
+        }
+    }
     fn edit_item(&mut self, reply: bool) {
+        if self.view == View::Details && self.detail_tab == 4 {
+            if let Some((tab, item)) = self.activity_target() {
+                if reply && tab != 1 {
+                    self.fail("Select a comment to quote-reply.");
+                    return;
+                }
+                let old = (self.detail_tab, self.item);
+                self.detail_tab = tab;
+                self.item = item;
+                self.edit_item(reply);
+                (self.detail_tab, self.item) = old;
+            } else {
+                self.fail("Field history is read-only; select a comment or worklog.");
+            }
+            return;
+        }
         if self.view == View::Calendar {
             if let Some(log) = self.day_logs().get(self.calendar_item).cloned().cloned() {
                 self.new_worklog(Some(log));
@@ -779,7 +1076,11 @@ impl App {
                                 .join("\n")
                         )
                     } else {
-                        comment.text.clone()
+                        if comment.editable_text.is_empty() {
+                            comment.text.clone()
+                        } else {
+                            comment.editable_text.clone()
+                        }
                     };
                     self.text_form(
                         if reply {
@@ -806,6 +1107,18 @@ impl App {
     }
 
     fn delete_item(&mut self) {
+        if self.view == View::Details && self.detail_tab == 4 {
+            if let Some((tab, item)) = self.activity_target() {
+                let old = (self.detail_tab, self.item);
+                self.detail_tab = tab;
+                self.item = item;
+                self.delete_item();
+                (self.detail_tab, self.item) = old;
+            } else {
+                self.fail("Field history cannot be deleted.");
+            }
+            return;
+        }
         if self.view == View::Calendar {
             if let Some(log) = self.day_logs().get(self.calendar_item) {
                 self.dialog = Some(Dialog::Confirm {
@@ -1042,12 +1355,17 @@ impl App {
                     .as_ref()
                     .and_then(|id| details.comments.iter_mut().find(|c| &c.id == id))
                 {
-                    comment.text = form.value.clone();
+                    comment.text = crate::jira::mention_preview(&form.value);
+                    comment.editable_text = form.value.clone();
+                    comment.updated = Local::now().to_rfc3339();
                 } else {
                     details.comments.push(Comment {
                         id: format!("demo-{}", details.comments.len()),
                         author: "You".into(),
-                        text: form.value.clone(),
+                        account_id: "demo-user".into(),
+                        created: Local::now().to_rfc3339(),
+                        text: crate::jira::mention_preview(&form.value),
+                        editable_text: form.value.clone(),
                         ..Default::default()
                     });
                 }
@@ -1060,6 +1378,14 @@ impl App {
             {
                 details.issue = issue.clone();
             }
+            let history = details
+                .activity
+                .iter()
+                .filter(|e| e.kind == crate::activity::Kind::History)
+                .cloned()
+                .collect();
+            details.activity =
+                crate::activity::timeline(&details.comments, &details.worklogs, history);
         }
     }
 
@@ -1085,7 +1411,11 @@ impl App {
             return;
         }
         if self.dialog.is_some() {
+            if self.mention_key(key) {
+                return;
+            }
             self.dialog_key(key);
+            self.sync_mentions();
             return;
         }
         if self.view == View::Image {
@@ -1095,7 +1425,16 @@ impl App {
             }
             return;
         }
+        if self.view == View::Notifications {
+            self.notification_key(key);
+            return;
+        }
         match key.code {
+            KeyCode::Char('N') => {
+                self.view = View::Notifications;
+                self.item = 0;
+                self.scroll = 0;
+            }
             KeyCode::Char('q') if self.view == View::Board => self.should_quit = true,
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.view = View::Board;
@@ -1130,8 +1469,14 @@ impl App {
                 }
             }
             KeyCode::Char('l') => self.edit_action(1),
-            KeyCode::Char('c') | KeyCode::Char('i') => {
-                self.detail_tab = if key.code == KeyCode::Char('c') { 1 } else { 3 };
+            KeyCode::Char('c') | KeyCode::Char('i') | KeyCode::Char('a')
+                if self.view != View::Calendar =>
+            {
+                self.detail_tab = match key.code {
+                    KeyCode::Char('c') => 1,
+                    KeyCode::Char('i') => 3,
+                    _ => 4,
+                };
                 self.item = 0;
                 self.scroll = 0;
                 if self.view != View::Details {
@@ -1145,6 +1490,7 @@ impl App {
                 View::Details => self.details_key(key),
                 View::Calendar => self.calendar_key(key),
                 View::Image => {}
+                View::Notifications => {}
             },
         }
     }
@@ -1179,7 +1525,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(key) = self.selected_issue().map(|i| i.key.clone()) {
-                    self.detail_tab = 0;
+                    self.detail_tab = 4;
                     self.item = 0;
                     self.scroll = 0;
                     self.load_details(key);
@@ -1195,6 +1541,7 @@ impl App {
             1 => d.comments.len(),
             2 => d.worklogs.len(),
             3 => d.attachments.len(),
+            4 => self.activity_entries().len(),
             _ => 0,
         });
         self.item = self.item.min(count.saturating_sub(1));
@@ -1203,12 +1550,12 @@ impl App {
     fn details_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Tab | KeyCode::Right => {
-                self.detail_tab = (self.detail_tab + 1) % 4;
+                self.detail_tab = (self.detail_tab + 1) % 5;
                 self.item = 0;
                 self.scroll = 0;
             }
             KeyCode::BackTab | KeyCode::Left => {
-                self.detail_tab = (self.detail_tab + 3) % 4;
+                self.detail_tab = (self.detail_tab + 4) % 5;
                 self.item = 0;
                 self.scroll = 0;
             }
@@ -1232,7 +1579,10 @@ impl App {
             KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
             KeyCode::Char('n') => {
-                if self.detail_tab == 1 {
+                if self.detail_tab == 1
+                    || (self.detail_tab == 4
+                        && self.activity_filter != crate::activity::Filter::Worklogs)
+                {
                     self.text_form(
                         "New comment · @{accountId|Name} mentions",
                         TextKind::Comment(None),
@@ -1243,7 +1593,12 @@ impl App {
                 }
             }
             KeyCode::Char('e') => self.edit_item(false),
-            KeyCode::Char('p') if self.detail_tab == 1 => self.edit_item(true),
+            KeyCode::Char('p') if matches!(self.detail_tab, 1 | 4) => self.edit_item(true),
+            KeyCode::Char('f') if self.detail_tab == 4 => {
+                self.activity_filter = self.activity_filter.next();
+                self.item = 0;
+                self.scroll = 0;
+            }
             KeyCode::Char('D') => self.delete_item(),
             KeyCode::Enter if self.detail_tab == 3 => self.open_attachment(),
             _ => {}
@@ -1304,6 +1659,9 @@ impl App {
                     crate::input::insert(&mut form.value, &mut form.cursor, "\n")
                 }
                 KeyCode::Enter => submit = true,
+                _ if matches!(form.kind, TextKind::Comment(_)) => {
+                    crate::mentions::edit(&mut form.value, &mut form.cursor, key)
+                }
                 _ => crate::input::edit(&mut form.value, &mut form.cursor, key),
             },
             Dialog::Worklog(form) => match key.code {
@@ -1331,8 +1689,13 @@ impl App {
                 KeyCode::Enter if form.field == 6 => submit = true,
                 KeyCode::Enter => form.field = (form.field + 1) % 8,
                 _ => {
+                    let comment = form.field == 3;
                     if let Some((value, cursor)) = worklog_input(form) {
-                        crate::input::edit(value, cursor, key);
+                        if comment {
+                            crate::mentions::edit(value, cursor, key);
+                        } else {
+                            crate::input::edit(value, cursor, key);
+                        }
                     }
                 }
             },
@@ -1379,6 +1742,7 @@ impl App {
             }
             _ => {}
         }
+        self.sync_mentions();
     }
 
     pub fn on_mouse(&mut self, event: MouseEvent) {
@@ -1387,6 +1751,41 @@ impl App {
         }
         let x = event.column;
         let y = event.row;
+        if self.mentions.is_some() {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                if let Some((_, index)) = self
+                    .hits
+                    .mentions
+                    .iter()
+                    .find(|(r, _)| contains(*r, x, y))
+                    .copied()
+                {
+                    self.mentions.as_mut().unwrap().index = index;
+                    self.select_mention();
+                }
+            }
+            return;
+        }
+        if self.dialog.is_none() && event.kind == MouseEventKind::Down(MouseButton::Left) {
+            if self.hits.notification.is_some_and(|r| contains(r, x, y)) {
+                self.view = View::Notifications;
+                self.item = 0;
+                return;
+            }
+            if self.view == View::Notifications {
+                if let Some((_, index)) = self
+                    .hits
+                    .notices
+                    .iter()
+                    .find(|(r, _)| contains(*r, x, y))
+                    .copied()
+                {
+                    self.item = index;
+                    self.open_notice();
+                }
+                return;
+            }
+        }
         if let Some(dialog) = &mut self.dialog {
             if event.kind != MouseEventKind::Down(MouseButton::Left) {
                 return;
@@ -1460,7 +1859,7 @@ impl App {
                         if self.last_click.as_ref().is_some_and(|(previous, time)| {
                             previous == &key && time.elapsed() < Duration::from_millis(450)
                         }) {
-                            self.detail_tab = 0;
+                            self.detail_tab = 4;
                             self.load_details(key);
                             self.last_click = None;
                         } else {
@@ -1521,6 +1920,28 @@ fn split_labels(value: &str) -> Vec<String> {
     labels
 }
 
+fn mapped_board(mut board: Board) -> Board {
+    let mapped: Vec<_> = board
+        .columns
+        .iter()
+        .flat_map(|c| c.statuses.iter())
+        .collect();
+    let statuses: Vec<_> = board
+        .issues
+        .iter()
+        .filter(|i| !mapped.contains(&&i.status_id))
+        .map(|i| i.status_id.clone())
+        .collect();
+    if !statuses.is_empty() {
+        board.columns.push(Column {
+            name: "Unmapped".into(),
+            statuses,
+            max: None,
+        });
+    }
+    board
+}
+
 pub fn demo_board() -> Board {
     Board{id:1,name:"Engineering · demo".into(),rank_field:Some(10020),columns:vec![
         Column{name:"To do".into(),statuses:vec!["1".into()],max:None},Column{name:"In progress".into(),statuses:vec!["2".into()],max:Some(4)},
@@ -1532,15 +1953,35 @@ pub fn demo_board() -> Board {
             ("DEMO-4","Comments and quoted replies","3","In review","Medium","comments"),
             ("DEMO-5","Secure credential commands","4","Done","High","security")].into_iter().map(|(key,summary,status_id,status,priority,label)|Issue{
                 key:key.into(),summary:summary.into(),status_id:status_id.into(),status:status.into(),priority:priority.into(),assignee:"Samir".into(),labels:vec![label.into()],
-                issue_type:"Task".into(),url:format!("https://example.atlassian.net/browse/{key}"),description:"A Jira workspace that stays inside Herdr.\n\n• Use the real Jira board configuration\n• Log time through a visual calendar\n• Keep every action keyboard-accessible\n\nThis is demo data; no network requests are made.".into(),time_spent:5400,
+                issue_type:"Task".into(),url:format!("https://example.atlassian.net/browse/{key}"),description:"A Jira workspace that stays inside Herdr.\n\n• Use the real Jira board configuration\n• Log time through a visual calendar\n• Keep every action keyboard-accessible\n\nThis is demo data; no network requests are made.".into(),time_spent:5400,updated:String::new(),
             }).collect()}
 }
 
 fn demo_details(key: &str) -> Details {
-    Details{issue:demo_board().issues.into_iter().find(|i|i.key==key).unwrap_or_default(),
-        comments:vec![Comment{id:"1".into(),author:"Alex".into(),account_id:"demo-alex".into(),created:"2026-10-10T09:15:00.000+0000".into(),text:"Please keep the calendar navigable with arrow keys.\n\n[image/attachment: Calendar mockup]".into()},Comment{id:"2".into(),author:"Samir".into(),account_id:"demo-user".into(),created:"2026-10-10T09:30:00.000+0000".into(),text:"Agreed. Tab will move between date, time, duration, and work description.".into()}],
-        worklogs:vec![Worklog{id:"1".into(),key:key.into(),author:"Samir".into(),account_id:"demo-user".into(),started:Calendar::default().jira_started("09:00").unwrap(),seconds:5400,text:"Built the calendar worklog dialog".into()}],
-        attachments:vec![Attachment{id:"1".into(),filename:"calendar-mockup.png".into(),mime:"image/png".into(),size:42000,..Default::default()}],warnings:Vec::new()}
+    let mut details=Details {
+        issue:demo_board().issues.into_iter().find(|i|i.key==key).unwrap_or_default(),
+        comments:vec![
+            Comment{id:"1".into(),author:"Alex".into(),account_id:"demo-alex".into(),created:"2026-10-10T09:15:00.000+0000".into(),text:"Please keep the calendar navigable with arrow keys.\n\n[image/attachment: Calendar mockup]".into(),..Default::default()},
+            Comment{id:"2".into(),author:"Samir".into(),account_id:"demo-user".into(),created:"2026-10-10T09:30:00.000+0000".into(),text:"Agreed. Tab will move between date, time, duration, and work description.".into(),..Default::default()}
+        ],
+        worklogs:vec![Worklog{id:"1".into(),key:key.into(),author:"Samir".into(),account_id:"demo-user".into(),started:Calendar::default().jira_started("09:00").unwrap(),seconds:5400,text:"Built the calendar worklog dialog".into(),..Default::default()}],
+        attachments:vec![Attachment{id:"1".into(),filename:"calendar-mockup.png".into(),mime:"image/png".into(),size:42000,..Default::default()}],
+        ..Default::default()
+    };
+    details.activity = crate::activity::timeline(
+        &details.comments,
+        &details.worklogs,
+        vec![crate::activity::Entry {
+            id: "history:demo".into(),
+            resource_id: "demo".into(),
+            kind: crate::activity::Kind::History,
+            at: "2026-10-10T10:00:00.000+0000".into(),
+            author: "Maya".into(),
+            title: "Status changed".into(),
+            body: "Status: To do → In progress\nAssignee: Unassigned → Samir".into(),
+        }],
+    );
+    details
 }
 
 #[cfg(test)]
@@ -1561,6 +2002,143 @@ mod tests {
         assert_eq!(app.board.issues[0].status_id, "1");
         app.on_key(key(KeyCode::Enter));
         assert_eq!(app.board.issues[0].status_id, "2");
+    }
+    #[test]
+    fn mention_selection_tags_a_person_without_submitting_the_draft() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('c')));
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_paste("Hello @Sa");
+        app.tick(Instant::now() + Duration::from_secs(1));
+        assert_eq!(app.mentions.as_ref().unwrap().users.len(), 1);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.mentions.is_none());
+        let Some(Dialog::Text(form)) = &app.dialog else {
+            panic!("Draft lost");
+        };
+        assert!(form.value.contains("@{demo-user|Samir Khanal}"));
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let details = app.details.as_ref().unwrap();
+        assert!(details
+            .comments
+            .last()
+            .unwrap()
+            .text
+            .contains("@Samir Khanal"));
+        assert!(details
+            .activity
+            .iter()
+            .any(|e| e.body.contains("Hello @Samir Khanal")));
+    }
+    #[test]
+    fn cancelling_suggestions_keeps_the_comment_and_stale_results_cannot_replace_it() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('c')));
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_paste("@Al");
+        let old = app.mentions.as_ref().unwrap().version;
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.dialog.is_some());
+        assert!(app.mentions.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_paste("@Sa");
+        app.on_message(Response {
+            generation: 999,
+            result: Ok(Data::Background(Box::new(Background::Users(
+                old,
+                Ok(crate::mentions::demo_users("Maya")),
+            )))),
+        });
+        assert!(app.mentions.as_ref().unwrap().users.is_empty());
+        app.tick(Instant::now() + Duration::from_secs(1));
+        assert_eq!(app.mentions.as_ref().unwrap().users[0].name, "Samir Khanal");
+    }
+    #[test]
+    fn background_changes_do_not_close_forms_or_release_a_pending_write() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('w')));
+        let mut board = app.board.clone();
+        board.issues[0].updated = "external".into();
+        let version = app.notifications.begin_poll();
+        app.on_message(Response {
+            generation: 999,
+            result: Ok(Data::Background(Box::new(Background::Poll(
+                version,
+                Ok(board.clone()),
+            )))),
+        });
+        assert!(matches!(app.dialog, Some(Dialog::Worklog(_))));
+        assert_eq!(app.notifications.unread(), 2);
+        app.busy = true;
+        app.pending_write = true;
+        let version = app.notifications.begin_poll();
+        app.on_message(Response {
+            generation: 999,
+            result: Ok(Data::Background(Box::new(Background::Poll(
+                version,
+                Ok(board),
+            )))),
+        });
+        assert!(app.busy);
+        assert!(app.pending_write);
+        assert!(app.dialog.is_some());
+    }
+    #[test]
+    fn activity_filters_and_actions_target_the_selected_resource() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.detail_tab, 4);
+        app.item = app
+            .activity_entries()
+            .iter()
+            .position(|e| e.kind == crate::activity::Kind::History)
+            .unwrap();
+        app.on_key(key(KeyCode::Char('D')));
+        assert!(app.dialog.is_none());
+        app.on_key(key(KeyCode::Char('e')));
+        assert!(app.dialog.is_none());
+        app.on_key(key(KeyCode::Char('f')));
+        assert_eq!(app.activity_filter, crate::activity::Filter::Comments);
+        assert!(app
+            .activity_entries()
+            .iter()
+            .all(|e| e.kind == crate::activity::Kind::Comment));
+        app.on_key(key(KeyCode::Char('p')));
+        assert!(matches!(app.dialog, Some(Dialog::Text(_))));
+    }
+    #[test]
+    fn notification_inbox_can_be_acknowledged_and_opens_ticket_activity() {
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('N')));
+        assert_eq!(app.view, View::Notifications);
+        app.on_key(key(KeyCode::Char('m')));
+        assert!(app.notifications.muted);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.view, View::Details);
+        assert_eq!(app.detail_tab, 4);
+        assert_eq!(app.notifications.unread(), 0);
+    }
+    #[test]
+    fn worklog_mentions_preserve_real_account_ids_during_editing() {
+        let log = Worklog {
+            editable_text: "@{id|Maya}".into(),
+            text: "@Maya".into(),
+            ..Default::default()
+        };
+        let form = WorklogForm::new("X-1".into(), None, Some(&log));
+        assert_eq!(form.comment, "@{id|Maya}");
+        let mut app = app();
+        app.on_key(key(KeyCode::Char('w')));
+        if let Some(Dialog::Worklog(form)) = &mut app.dialog {
+            form.field = 3;
+        }
+        app.on_paste("@Ma");
+        app.tick(Instant::now() + Duration::from_secs(1));
+        app.on_key(key(KeyCode::Enter));
+        let Some(Dialog::Worklog(form)) = &app.dialog else {
+            panic!("Worklog draft lost");
+        };
+        assert!(form.comment.contains("@{demo-maya|Maya Patel}"));
     }
     #[test]
     fn failed_save_retains_form_and_unicode_input() {

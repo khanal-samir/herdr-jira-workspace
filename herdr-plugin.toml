@@ -1,7 +1,7 @@
 id = "herdr-jira-workspace"
 name = "Jira Workspace"
-version = "0.1.0"
-description = "Native Jira Kanban board with calendar worklogs, comments, labels and attachments."
+version = "0.2.0"
+description = "Native Jira boards, ticket activity, calendar worklogs, @ user tagging and Herdr alerts."
 min_herdr_version = "0.7.0"
 platforms = ["linux", "macos"]
 

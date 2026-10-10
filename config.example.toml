@@ -6,6 +6,11 @@
 # 0 opens a board picker. Set an actual Jira board ID to skip it.
 board_id = 0
 
+# Selected-board change alerts while this workspace runs; not Jira's inbox.
+[notifications]
+enabled = true
+interval_seconds = 60 # 30–3600 seconds; N opens inbox, m mutes toasts
+
 [jira]
 base_url = "https://yourcompany.atlassian.net"
 auth = "basic" # basic for Cloud; bearer for Server/Data Center
