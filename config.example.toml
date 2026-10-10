@@ -1,0 +1,16 @@
+# Optional: when this plugin has no config, it reuses the existing herdr-jira
+# plugin's [jira] credentials. It never modifies that plugin.
+# Place this file outside the repository:
+# ~/.config/herdr/plugins/config/herdr-jira-workspace/config.toml
+
+# 0 opens a board picker. Set an actual Jira board ID to skip it.
+board_id = 0
+
+[jira]
+base_url = "https://yourcompany.atlassian.net"
+auth = "basic" # basic for Cloud; bearer for Server/Data Center
+email = "you@company.com"
+# Recommended: keep tokens in your credential store, not this file.
+api_token_cmd = "pass jira-api-token"
+# macOS: api_token_cmd = "security find-generic-password -s jira-api-token -w"
+max_results = 100 # Page size, not a total issue limit

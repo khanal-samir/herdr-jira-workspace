@@ -1,0 +1,36 @@
+id = "herdr-jira-workspace"
+name = "Jira Workspace"
+version = "0.1.0"
+description = "Native Jira Kanban board with calendar worklogs, comments, labels and attachments."
+min_herdr_version = "0.7.0"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["sh", "scripts/build.sh"]
+
+[[panes]]
+id = "workspace"
+title = "Jira Workspace"
+placement = "tab"
+command = ["./target/release/herdr-jira-workspace"]
+
+[[panes]]
+id = "demo"
+title = "Jira Workspace Demo"
+placement = "tab"
+command = ["./target/release/herdr-jira-workspace", "--demo"]
+
+[[actions]]
+id = "demo"
+title = "Jira Workspace: offline demo"
+command = ["sh", "scripts/open.sh", "tab", "demo"]
+
+[[actions]]
+id = "open"
+title = "Jira Workspace: open"
+command = ["sh", "scripts/open.sh", "tab"]
+
+[[actions]]
+id = "open-split"
+title = "Jira Workspace: open split"
+command = ["sh", "scripts/open.sh", "split"]

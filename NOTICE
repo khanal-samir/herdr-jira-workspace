@@ -1,0 +1,9 @@
+This project includes authentication and ADF traversal ideas/code adapted from:
+
+a2u/herdr-jira
+https://github.com/a2u/herdr-jira
+Declared license: MIT
+
+The original plugin and the user's local modifications are not changed or
+bundled with private configuration. This repository provides an independent
+Herdr plugin manifest, UI, calendar workflows, and test suite.
