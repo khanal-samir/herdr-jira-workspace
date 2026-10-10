@@ -71,6 +71,8 @@ fn server(expectations: Vec<Expected>, cloud: bool) -> (JiraClient, std::thread:
                     Err(error) => panic!("{error}"),
                 }
             };
+            // macOS may inherit the listener's nonblocking mode on accepted sockets.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
